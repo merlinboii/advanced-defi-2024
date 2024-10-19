@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >= 0.4 < 0.9;
+pragma solidity >=0.4 <0.9;
 
-import {IUniswapV2Pair} from
-    "../../../src/interfaces/uniswap-v2/IUniswapV2Pair.sol";
+import {IUniswapV2Pair} from "../../../src/interfaces/uniswap-v2/IUniswapV2Pair.sol";
 import {FixedPoint} from "../../../src/uniswap-v2/FixedPoint.sol";
 
 // Modified from https://github.com/Uniswap/v2-periphery/blob/master/contracts/examples/ExampleOracleSimple.sol
@@ -22,7 +21,7 @@ contract UniswapV2Twap {
     uint256 public price0CumulativeLast;
     uint256 public price1CumulativeLast;
     // Last timestamp the cumulative prices were updated
-    uint32 public updatedAt;
+    uint32 public updatedAt;    //@note track the t update for this contract
 
     // TWAP of token0 and token1
     // range: [0, 2**112 - 1]
@@ -32,15 +31,25 @@ contract UniswapV2Twap {
     // TWAP of token1 in terms of token0
     FixedPoint.uq112x112 public price1Avg;
 
+    // custom errors
+    error WaitTimeTooShort();
+    error NoPairSupport();
+
     // Exercise 1
     constructor(address _pair) {
         // 1. Set pair contract from constructor input
-        pair = IUniswapV2Pair(address(0));
+        pair = IUniswapV2Pair(_pair); //@note set up the external pair contract from DEX -> Uniswap V2
+
         // 2. Set token0 and token1 from pair contract
-        token0 = address(0);
-        token1 = address(0);
+        token0 = pair.token0();
+        token1 = pair.token1();
+
         // 3. Store price0CumulativeLast and price1CumulativeLast from pair contract
+        price0CumulativeLast = pair.price0CumulativeLast();
+        price1CumulativeLast = pair.price1CumulativeLast();
+
         // 4. Call pair.getReserve to get last timestamp the reserves were updated
+        (, , updatedAt) = pair.getReserves();
         //    and store it into the state variable updatedAt
     }
 
@@ -52,6 +61,10 @@ contract UniswapV2Twap {
         returns (uint256 price0Cumulative, uint256 price1Cumulative)
     {
         // 1. Get latest cumulative prices from the pair contract
+        (price0Cumulative, price1Cumulative) = (
+            pair.price0CumulativeLast(),
+            pair.price1CumulativeLast()
+        );
 
         // If current block timestamp > last timestamp reserves were updated,
         // calculate cumulative prices until current time.
@@ -59,40 +72,48 @@ contract UniswapV2Twap {
 
         // 2. Get reserves and last timestamp the reserves were updated from
         //    the pair contract
-        (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast) =
-            (0, 0, 0);
+        (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast) = pair
+            .getReserves();
 
         // 3. Cast block.timestamp to uint32
-        uint32 blockTimestamp = 0;
+        uint32 blockTimestamp = uint32(block.timestamp % 2 ** 32);  //@note this is safe-cast as it will ensure that before casting from larger type to the smaller one, it make sure that the valus is adjust in the accepted ragnge of unit32 -> % 2^32 (is mod 32 bits -> so the value garauntee to less that max(uint32))
         if (blockTimestampLast != blockTimestamp) {
+            //@note garuantee that reservers were updated then calculate the cumulative until this current block
             // 4. Calculate elapsed time
-            uint32 dt;
-
+            uint32 dt = blockTimestamp - blockTimestampLast; //@note garuantee that it will not underflows as the current will > the last one
             // Addition overflow is desired
             unchecked {
                 // 5. Add spot price * elapsed time to cumulative prices.
                 //    - Use FixedPoint.fraction to calculate spot price.
                 //    - FixedPoint.fraction returns UQ112x112, so cast it into uint256.
                 //    - Multiply spot price by time elapsed
-                price0Cumulative += 0;
-                price1Cumulative += 0;
+                //@note this is the case of calculate price with the current timestamp (t_n, p_n)
+                //@note price0 -> reserver1/reserve0 | price1 -> reserve0/reserve1 => 1/price0
+                price0Cumulative +=
+                    uint256((reserve1.fraction(reserve0))._x) * dt;
+                price1Cumulative +=
+                    uint256((reserve0.fraction(reserve1))._x) * dt;
             }
         }
+        //@note if blockTimestampLast == blockTimestamp returns (price0Cumulative, price1Cumulative) received from the top of this fn()
     }
 
     // Exercise 3
     // Updates cumulative prices
     function update() external {
-        // 1. Cast block.timestamp to uint32
-        uint32 blockTimestamp = 0;
+        // 1. Cast block.timestamp to uint32 //@note safe-cast the current timestamp
+        uint32 blockTimestamp = uint32(block.timestamp % 2 ** 32);
         // 2. Calculate elapsed time since last time cumulative prices were
         //    updated in this contract
-        uint32 dt = 0;
+        uint32 dt = blockTimestamp - updatedAt; //@note this update is done within the contract context, so need to use its own state -> updateAt
         // 3. Require time elapsed >= MIN_WAIT
-
+        if (dt < MIN_WAIT) revert WaitTimeTooShort();
         // 4. Call the internal function _getCurrentCumulativePrices to get
         //    current cumulative prices
-        (uint256 price0Cumulative, uint256 price1Cumulative) = (0, 0);
+        (
+            uint256 price0Cumulative,
+            uint256 price1Cumulative
+        ) = _getCurrentCumulativePrices();
 
         // Overflow is desired, casting never truncates
         // https://docs.uniswap.org/contracts/v2/guides/smart-contract-integration/building-an-oracle
@@ -103,24 +124,43 @@ contract UniswapV2Twap {
             // 5. Calculate TWAP price0Avg and price1Avg
             //    - TWAP = (current cumulative price - last cumulative price) / dt
             //    - Cast TWAP into uint224 and then into FixedPoint.uq112x112
-            price0Avg = FixedPoint.uq112x112(0);
-            price1Avg = FixedPoint.uq112x112(0);
-        }
 
+            /** @note 
+            TWAP = (current cumulative price - last cumulative price) / dt
+            current cumulative price - cumulative price retrieved from UniswapV2 + the cumulative until this current tsว
+            last cumulative price - the last cumulative in this contract -> priceXCumulativeLast
+            */
+            price0Avg = FixedPoint.uq112x112(
+                uint224(
+                    ((price0Cumulative - price0CumulativeLast) / dt) % 2 ** 224
+                )
+            );
+            price1Avg = FixedPoint.uq112x112(
+                uint224(
+                    ((price1Cumulative - price1CumulativeLast) / dt) % 2 ** 224
+                )
+            );
+        }
+        //@note update our cumulative so far
         // 6. Update state variables price0CumulativeLast, price1CumulativeLast and updatedAt
+        (price0CumulativeLast, price1CumulativeLast) = (
+            price0Cumulative,
+            price1Cumulative
+        );
+        updatedAt = blockTimestamp;
     }
 
     // Exercise 4
     // Returns the amount out corresponding to the amount in for a given token
-    function consult(address tokenIn, uint256 amountIn)
-        external
-        view
-        returns (uint256 amountOut)
-    {
+    function consult(
+        address tokenIn,
+        uint256 amountIn
+    ) external view returns (uint256 amountOut) {
         // 1. Require tokenIn is either token0 or token1
+        if (tokenIn != token0 && tokenIn != token1) revert NoPairSupport();
 
         // 2. Calculate amountOut
-        //    - amountOut = TWAP of tokenIn * amountIn
+        //    - amountOut = TWAP of tokenIn * amountIn  //@note === price1/0 * amount0 || price0/1 * amount1
         //    - Use FixePoint.mul to multiply TWAP of tokenIn with amountIn
         //    - FixedPoint.mul returns uq144x112, use FixedPoint.decode144 to return uint144
         if (tokenIn == token0) {
@@ -131,9 +171,10 @@ contract UniswapV2Twap {
             //   tokenIn = WETH
             //   amountIn = 2
             //   amountOut = price0Avg * amountIn = 4000 USDC
-            amountOut = 0;
+            amountOut = (price0Avg.mul(amountIn)).decode144();
         } else {
-            amountOut = 0;
+            //@note tokenIn == token1
+            amountOut = (price1Avg.mul(amountIn)).decode144();
         }
     }
 }
