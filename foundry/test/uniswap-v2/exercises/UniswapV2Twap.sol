@@ -127,8 +127,8 @@ contract UniswapV2Twap {
 
             /** @note 
             TWAP = (current cumulative price - last cumulative price) / dt
-            current cumulative price - cumulative price retrieved from UniswapV2 + the cumulative until this current tsว
-            last cumulative price - the last cumulative in this contract -> priceXCumulativeLast
+            current cumulative price: cumulative price last retrieved from UniswapV2 + the cumulative until this current ts
+            last cumulative price: the last cumulative in this contract -> priceXCumulativeLast
             */
             price0Avg = FixedPoint.uq112x112(
                 uint224(
